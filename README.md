@@ -1,4 +1,4 @@
-# ESP32 INA219 Dashboard — Setup Instructions
+<img src="https://github.com/xiv3r/esp32-ina219/blob/main/esp32-ina219.png">
 
 ## 1. Hardware Wiring
 
