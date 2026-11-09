@@ -2,6 +2,7 @@
  * ESP32 INA219 Relay + WiFi AP Dashboard
  */
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -40,8 +41,11 @@ volatile float g_voltage = 0.0f;
 volatile float g_current = 0.0f;
 volatile float g_power   = 0.0f;
 
+#define CONFIG_VERSION 2
+
 #pragma pack(push, 1)
 struct Config {
+  uint8_t version;
   float vThresh;
   float iThresh;
   float pThresh;
@@ -50,12 +54,20 @@ struct Config {
   bool  useVoltage;
   bool  useCurrent;
   bool  usePower;
+  char    apSsid[33];
+  char    apPass[64];
+  uint8_t apChannel;
+  bool    apHidden;
+  uint8_t apMaxClients;
 };
 #pragma pack(pop)
 
 static Config cfg = {
+  CONFIG_VERSION,
   0.0f, 0.0f, 0.0f,
-  true, false, false, false, false
+  true, false, false, false, false,
+  "ESP32_INA219", "12345678",
+  1, false, 4
 };
 
 static bool     cfgDirty        = false;
@@ -77,6 +89,7 @@ static void doFactoryReset();
 static void startAP();
 static void startCaptivePortal();
 static void flushConfigIfDue(uint32_t now, bool force);
+static String portalUrl();
 
 // ---------------------------------------------------------------------------
 // PROGMEM pages
@@ -101,8 +114,9 @@ h1{font-size:18px;margin:0 0 6px;letter-spacing:.4px}
 .row:last-child{border-bottom:0}
 .val{font-variant-numeric:tabular-nums;color:#63e6a8;font-weight:600}
 label{display:block;font-size:12px;color:#8aa0c0;margin:8px 0 4px}
-input[type=number]{width:100%;padding:10px;background:#0b1220;border:1px solid #24406d;border-radius:8px;color:#e6eefc;font-size:16px;outline:none}
+input[type=number],input[type=text]{width:100%;padding:10px;background:#0b1220;border:1px solid #24406d;border-radius:8px;color:#e6eefc;font-size:16px;outline:none}
 input:focus{border-color:#1f6feb}
+input:disabled{opacity:.5;cursor:not-allowed}
 .btn{display:inline-block;padding:11px 16px;background:#1f6feb;color:#fff;border:0;border-radius:10px;font-size:14px;cursor:pointer;min-height:42px}
 .btn.secondary{background:#24406d}
 .btn.danger{background:#e5484d}
@@ -168,12 +182,27 @@ input:focus{border-color:#1f6feb}
 
 <div id="tab-wifi" class="hide">
 <div class="card"><h2>WiFi Access Point</h2>
-<div class="row"><span>SSID</span><span class="val">ESP32_INA219</span></div>
-<div class="row"><span>Password</span><span class="val">••••••••</span></div>
 <div class="row"><span>Status</span><span><span class="pill on">ALWAYS ACTIVE</span></span></div>
 <div class="row"><span>IP</span><span class="val" id="apIp">192.168.4.1</span></div>
 <div class="row"><span>Clients</span><span class="val" id="apClients">0</span></div>
 <div class="row"><span>Captive portal</span><span><span class="pill on">ENABLED</span></span></div>
+<label>SSID (1–32 chars)</label>
+<input type="text" id="ssid" maxlength="32">
+<div class="row"><span>Change password</span>
+<label class="toggle"><input type="checkbox" id="chgPass"><span class="slider"></span></label></div>
+<label>New password (empty = open network, or 8–63 chars)</label>
+<input type="text" id="pass" maxlength="63" disabled placeholder="unchanged">
+<div class="grid3" style="margin-top:6px">
+<div><label>Channel (1–13)</label><input type="number" min="1" max="13" id="ch"></div>
+<div><label>Max clients (1–8)</label><input type="number" min="1" max="8" id="maxCli"></div>
+<div><label>Hidden SSID</label>
+<label class="toggle"><input type="checkbox" id="hidden"><span class="slider"></span></label></div>
+</div>
+<div style="margin-top:12px"><button class="btn" id="saveAp">Save &amp; Reboot</button></div>
+<div class="msg" id="apMsg"></div>
+<div style="margin-top:14px;font-size:11px;color:#8aa0c0;line-height:1.5">
+Forgot the AP password? Hold the BOOT button for 5 seconds to factory reset.
+</div>
 </div></div>
 
 <div id="tab-sys" class="hide">
@@ -209,6 +238,15 @@ input:focus{border-color:#1f6feb}
   $('vU').checked=!!s.vU;$('iU').checked=!!s.iU;$('pU').checked=!!s.pU;
   $('apIp').textContent=s.ip||'192.168.4.1';
   $('apClients').textContent=s.cli||0;
+  if(!$('ssid').dataset.dirty){
+    $('ssid').value=s.ssid||'';
+    $('ch').value=s.ch||1;
+    $('maxCli').value=s.maxCli||4;
+    $('hidden').checked=!!s.hidden;
+  }
+  if(!$('chgPass').checked){
+    $('pass').value='';
+  }
   $('uptime').textContent=s.up||'--';
   $('heap').textContent=s.heap||'--';
   $('minheap').textContent=s.minheap||'--';
@@ -233,6 +271,34 @@ input:focus{border-color:#1f6feb}
    setTimeout(function(){$('relayMsg').textContent=''},2500);
   }).catch(function(){$('relayMsg').textContent='Network error.'});
  });
+ ['ssid','ch','maxCli','hidden'].forEach(function(id){
+   var el=$(id); if(!el) return;
+   el.addEventListener('input',function(){el.dataset.dirty='1'});
+ });
+ $('chgPass').addEventListener('change',function(){
+   $('pass').disabled = !this.checked;
+   if(this.checked){ $('pass').focus(); } else { $('pass').value=''; }
+ });
+ $('saveAp').addEventListener('click',function(){
+  var ssid=$('ssid').value.trim();
+  var changePass=$('chgPass').checked;
+  var pass=$('pass').value;
+  if(ssid.length<1||ssid.length>32){$('apMsg').textContent='SSID must be 1–32 chars.';return}
+  if(changePass && pass.length!==0 && (pass.length<8||pass.length>63)){$('apMsg').textContent='Password must be empty or 8–63 chars.';return}
+  if(!confirm('Changing WiFi AP settings will disconnect you and reboot the ESP32. Continue?'))return;
+  var body={
+   ssid:ssid,
+   ch:parseFloat($('ch').value)||1,
+   maxCli:parseFloat($('maxCli').value)||4,
+   hidden:$('hidden').checked
+  };
+  if(changePass){ body.pass=pass; }
+  $('apMsg').textContent='Saving and rebooting… you will be disconnected.';
+  post('/api/ap',body).then(function(r){
+   if(r && r.ok){ $('apMsg').textContent='Rebooting… reconnect to your AP.'; }
+   else { $('apMsg').textContent='Save failed.'; }
+  }).catch(function(){ $('apMsg').textContent='Rebooting… reconnect to your AP.'; });
+ });
  $('btnRestart').addEventListener('click',function(){
   if(!confirm('Restart ESP32?'))return;
   post('/api/restart').then(function(){$('sysMsg').textContent='Restarting…'});
@@ -243,15 +309,6 @@ input:focus{border-color:#1f6feb}
  });
 })();
 </script></body></html>)HTML";
-
-static const char PORTAL_HTML[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="0;url=http://192.168.4.1/">
-<title>ESP32 INA219</title></head>
-<body style="font-family:sans-serif;background:#0b1220;color:#e6eefc;text-align:center;padding:40px">
-<h2>ESP32 INA219</h2><p>Redirecting…</p>
-<a style="color:#63e6a8" href="http://192.168.4.1/">Open dashboard</a>
-</body></html>)HTML";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -290,17 +347,26 @@ static void loadConfig(){
   Config tmp;
   bool ok=false;
   if(got==sizeof(Config)){
-    if(prefs.getBytes("cfg",&tmp,sizeof(tmp))==sizeof(tmp) && cfgCrc(tmp)==storedCrc){
+    if(prefs.getBytes("cfg",&tmp,sizeof(tmp))==sizeof(tmp)
+       && tmp.version==CONFIG_VERSION
+       && cfgCrc(tmp)==storedCrc){
       cfg=tmp; ok=true;
     }
   }
   prefs.end();
   if(!ok){
+    cfg.version          = CONFIG_VERSION;
     cfg.vThresh=0; cfg.iThresh=0; cfg.pThresh=0;
     cfg.relayActiveHigh=true; cfg.relayEnabled=false;
     cfg.useVoltage=cfg.useCurrent=cfg.usePower=false;
+    strncpy(cfg.apSsid, AP_SSID, sizeof(cfg.apSsid)-1); cfg.apSsid[sizeof(cfg.apSsid)-1]=0;
+    strncpy(cfg.apPass, AP_PASS, sizeof(cfg.apPass)-1); cfg.apPass[sizeof(cfg.apPass)-1]=0;
+    cfg.apChannel=1; cfg.apHidden=false; cfg.apMaxClients=4;
     cfgDirty=true;
   }
+  if(!cfg.apSsid[0]){ strncpy(cfg.apSsid, AP_SSID, sizeof(cfg.apSsid)-1); cfg.apSsid[sizeof(cfg.apSsid)-1]=0; }
+  if(cfg.apChannel<1||cfg.apChannel>13) cfg.apChannel=1;
+  if(cfg.apMaxClients<1||cfg.apMaxClients>8) cfg.apMaxClients=4;
 }
 
 static void flushConfigIfDue(uint32_t now, bool force){
@@ -374,6 +440,14 @@ static void doFactoryReset(){
   prefs.begin("ina219", false);
   prefs.clear();
   prefs.end();
+  cfg = Config{
+    CONFIG_VERSION,
+    0.0f, 0.0f, 0.0f,
+    true, false, false, false, false,
+    "ESP32_INA219", "12345678",
+    1, false, 4
+  };
+  g_relayOn = false;
   for(int k=0;k<6;++k){
     digitalWrite(RELAY_PIN,(k&1)?LOW:HIGH);
     delay(120);
@@ -385,23 +459,41 @@ static void doFactoryReset(){
 // ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
-static void handleRoot(){ server.send_P(200,"text/html",INDEX_HTML); }
-static void handlePortal(){ server.send_P(200,"text/html",PORTAL_HTML); }
+static void handleRoot(){
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.send_P(200,"text/html",INDEX_HTML);
+}
+
+static void handlePortal(){
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.send_P(200,"text/html",INDEX_HTML);
+}
 
 static void handleAndroid204(){
-  server.send(204,"text/plain","");
+  String url = portalUrl();
+  server.sendHeader("Location", url, true);
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.send(302,"text/plain","");
 }
 
 static void handleState(){
-  static char buf[512];
+  static char buf[1024];
   uint64_t upUs = (uint64_t)esp_timer_get_time();
   unsigned long upSec = (unsigned long)(upUs/1000000ULL);
+  String ip = WiFi.softAPIP().toString();
   int n = snprintf(buf, sizeof(buf),
     "{\"v\":%.3f,\"i\":%.4f,\"p\":%.3f,"
     "\"relay\":%s,\"en\":%s,\"ah\":%s,"
     "\"vT\":%.3f,\"iT\":%.4f,\"pT\":%.3f,"
     "\"vU\":%s,\"iU\":%s,\"pU\":%s,"
-    "\"ip\":\"192.168.4.1\",\"cli\":%u,"
+    "\"ip\":\"%s\",\"cli\":%u,"
+    "\"ssid\":\"%.32s\",\"ch\":%u,\"hidden\":%s,\"maxCli\":%u,"
     "\"heap\":%u,\"minheap\":%u,"
     "\"up\":\"%lus\",\"rst\":\"%d\"}",
     (double)g_voltage,(double)g_current,(double)g_power,
@@ -412,7 +504,12 @@ static void handleState(){
     cfg.useVoltage?"true":"false",
     cfg.useCurrent?"true":"false",
     cfg.usePower?"true":"false",
+    ip.c_str(),
     (unsigned)WiFi.softAPgetStationNum(),
+    cfg.apSsid,
+    (unsigned)cfg.apChannel,
+    cfg.apHidden?"true":"false",
+    (unsigned)cfg.apMaxClients,
     (unsigned)ESP.getFreeHeap(),
     (unsigned)ESP.getMinFreeHeap(),
     upSec,
@@ -450,6 +547,22 @@ static bool jBool(const char* b,const char* k,bool& o){
   if(!strncmp(p,"false",5)){ o=false; return true; }
   return false;
 }
+static bool jStr(const char* b,const char* k,char* out,size_t outLen){
+  if(!out||outLen==0) return false;
+  const char* p=findKey(b,k);
+  if(!p) return false;
+  p += strlen(k)+3;
+  while(*p==' ') p++;
+  if(*p!='"') return false;
+  p++;
+  size_t i=0;
+  while(*p && *p!='"' && i<outLen-1){
+    if(*p=='\\' && p[1]){ p++; }
+    out[i++]=*p++;
+  }
+  out[i]='\0';
+  return (*p=='"');
+}
 
 static void handleConfig(){
   if(!server.hasArg("plain")){ server.send(400,"application/json","{\"ok\":false}"); return; }
@@ -465,6 +578,7 @@ static void handleConfig(){
   if(!isfinite(iT)||iT<0||iT>3.2f) iT=0;
   if(!isfinite(pT)||pT<0||pT>100)  pT=0;
 
+  cfg.version = CONFIG_VERSION;
   cfg.relayEnabled=en; cfg.relayActiveHigh=ah;
   cfg.useVoltage=vU;   cfg.useCurrent=iU;    cfg.usePower=pU;
   cfg.vThresh=vT;      cfg.iThresh=iT;       cfg.pThresh=pT;
@@ -477,10 +591,62 @@ static void handleConfig(){
   server.send(200,"application/json","{\"ok\":true}");
 }
 
+static bool validSsid(const char* s){ size_t n=strlen(s); return n>=1 && n<=32; }
+static bool validPass(const char* s){ size_t n=strlen(s); return n==0 || (n>=8 && n<=63); }
+
+static void handleApConfig(){
+  if(!server.hasArg("plain")){ server.send(400,"application/json","{\"ok\":false,\"err\":\"body\"}"); return; }
+  const char* body = server.arg("plain").c_str();
+
+  char ssid[33] = {0};
+  char pass[64] = {0};
+  float ch = (float)cfg.apChannel;
+  float maxCli = (float)cfg.apMaxClients;
+  bool  hidden = cfg.apHidden;
+
+  if(!jStr(body,"ssid",ssid,sizeof(ssid)) || !validSsid(ssid)){
+    server.send(400,"application/json","{\"ok\":false,\"err\":\"ssid\"}"); return;
+  }
+  if(jStr(body,"pass",pass,sizeof(pass))){
+    if(!validPass(pass)){
+      server.send(400,"application/json","{\"ok\":false,\"err\":\"pass\"}"); return;
+    }
+  } else {
+    strncpy(pass, cfg.apPass, sizeof(pass)-1);
+    pass[sizeof(pass)-1]=0;
+    if(!pass[0]){
+      strncpy(pass, AP_PASS, sizeof(pass)-1);
+      pass[sizeof(pass)-1]=0;
+    }
+  }
+  jNum(body,"ch",ch);
+  jBool(body,"hidden",hidden);
+  jNum(body,"maxCli",maxCli);
+
+  strncpy(cfg.apSsid, ssid, sizeof(cfg.apSsid)-1); cfg.apSsid[sizeof(cfg.apSsid)-1]=0;
+  strncpy(cfg.apPass, pass, sizeof(cfg.apPass)-1); cfg.apPass[sizeof(cfg.apPass)-1]=0;
+  cfg.apChannel    = (uint8_t)constrain((int)ch, 1, 13);
+  cfg.apHidden     = hidden;
+  cfg.apMaxClients = (uint8_t)constrain((int)maxCli, 1, 8);
+  cfgDirty = true;
+
+  flushConfigIfDue(millis(), true);
+  if(cfgDirty){
+    server.sendHeader("Cache-Control","no-store");
+    server.send(500,"application/json","{\"ok\":false,\"err\":\"nvs\"}");
+    server.client().stop();
+    return;
+  }
+
+  server.sendHeader("Cache-Control","no-store");
+  server.send(200,"application/json","{\"ok\":true,\"reboot\":true}");
+  delay(600);
+  ESP.restart();
+}
+
 static void handleRestart(){
   server.sendHeader("Cache-Control","no-store");
   server.send(200,"application/json","{\"ok\":true}");
-  server.client().flush();
   delay(150);
   flushConfigIfDue(millis(), true);
   ESP.restart();
@@ -489,35 +655,77 @@ static void handleRestart(){
 static void handleFactory(){
   server.sendHeader("Cache-Control","no-store");
   server.send(200,"application/json","{\"ok\":true}");
-  server.client().flush();
   delay(200);
   doFactoryReset();
 }
 
 static void handleNotFound(){
-  server.sendHeader("Location","http://192.168.4.1/",true);
-  server.send_P(302,"text/html",PORTAL_HTML);
+  if(server.method() != HTTP_GET){
+    server.send(405,"text/plain","");
+    return;
+  }
+  String uri = server.uri();
+  if((uri == "/" || uri == "/index.html") &&
+     server.hostHeader() == WiFi.softAPIP().toString()){
+    server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
+    server.sendHeader("Pragma","no-cache");
+    server.sendHeader("Expires","0");
+    server.send_P(200,"text/html",INDEX_HTML);
+    return;
+  }
+  String url = portalUrl();
+  server.sendHeader("Location", url, true);
+  server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma","no-cache");
+  server.sendHeader("Expires","0");
+  server.send(302,"text/plain","");
 }
 
 // ---------------------------------------------------------------------------
 // WiFi
 // ---------------------------------------------------------------------------
+static String portalUrl(){
+  return String("http://") + WiFi.softAPIP().toString() + "/";
+}
+
 static void startAP(){
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),IPAddress(255,255,255,0));
-  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+  const char* ssid = cfg.apSsid;
+  const char* pass = cfg.apPass;
+  uint8_t ch  = (cfg.apChannel    ? cfg.apChannel    : 1);
+  uint8_t maxc= (cfg.apMaxClients ? cfg.apMaxClients : 4);
+  bool up = WiFi.softAP(ssid, pass, ch, cfg.apHidden, maxc);
+  if(!up && ch > 11){
+    ch = 11;
+    up = WiFi.softAP(ssid, pass, ch, cfg.apHidden, maxc);
+    if(up){
+      cfg.apChannel = ch;
+      cfgDirty = true;
+    }
+  }
+  if(!up && ch > 1){
+    ch = 1;
+    up = WiFi.softAP(ssid, pass, ch, cfg.apHidden, maxc);
+    if(up){
+      cfg.apChannel = ch;
+      cfgDirty = true;
+    }
+  }
 }
 
 static void startCaptivePortal(){
+  dnsServer.stop();
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(53,"*",IPAddress(192,168,4,1));
+  dnsServer.start(53,"*",WiFi.softAPIP());
 }
 
 static void maintainAP(uint32_t now){
   if(!timeReached(now,tLastWifiCheck,WIFI_RECHECK_MS)) return;
   tLastWifiCheck=now;
-  if(WiFi.getMode()!=WIFI_AP){
+  wifi_mode_t m = WiFi.getMode();
+  if(m != WIFI_AP && m != WIFI_AP_STA){
     startAP();
     startCaptivePortal();
   }
@@ -543,18 +751,23 @@ void setup(){
   startCaptivePortal();
 
   server.on("/",HTTP_GET,handleRoot);
+  server.on("/index.html",HTTP_GET,handleRoot);
   server.on("/api/state",HTTP_GET,handleState);
   server.on("/api/config",HTTP_POST,handleConfig);
+  server.on("/api/ap",HTTP_POST,handleApConfig);
   server.on("/api/restart",HTTP_POST,handleRestart);
   server.on("/api/factory",HTTP_POST,handleFactory);
 
   server.on("/generate_204",HTTP_GET,handleAndroid204);
   server.on("/gen_204",HTTP_GET,handleAndroid204);
   server.on("/hotspot-detect.html",HTTP_GET,handlePortal);
+  server.on("/library/test/success.html",HTTP_GET,handlePortal);
   server.on("/canonical.html",HTTP_GET,handlePortal);
-  server.on("/success.txt",HTTP_GET,handlePortal);
-  server.on("/ncsi.txt",HTTP_GET,handlePortal);
   server.on("/connecttest.txt",HTTP_GET,handlePortal);
+  server.on("/ncsi.txt",HTTP_GET,handlePortal);
+  server.on("/redirect",HTTP_GET,handlePortal);
+  server.on("/success.txt",HTTP_GET,handlePortal);
+  server.on("/kindle-wifi/wifistub.html",HTTP_GET,handlePortal);
   server.onNotFound(handleNotFound);
   server.begin();
 
