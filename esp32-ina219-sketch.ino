@@ -233,9 +233,14 @@ Forgot the AP password? Hold the BOOT button for 5 seconds to factory reset.
  function applyState(s){
   $('v').textContent=fmt(s.v,2);$('i').textContent=fmt(s.i,3);$('p').textContent=fmt(s.p,2);
   setPill($('relayPill'),s.relay);setPill($('relayPill2'),s.relay);
-  $('enabled').checked=!!s.en;$('activeHigh').checked=!!s.ah;
-  $('vT').value=s.vT;$('iT').value=s.iT;$('pT').value=s.pT;
-  $('vU').checked=!!s.vU;$('iU').checked=!!s.iU;$('pU').checked=!!s.pU;
+  if(!$('enabled').dataset.dirty) $('enabled').checked=!!s.en;
+  if(!$('activeHigh').dataset.dirty) $('activeHigh').checked=!!s.ah;
+  if(!$('vT').dataset.dirty) $('vT').value=s.vT;
+  if(!$('iT').dataset.dirty) $('iT').value=s.iT;
+  if(!$('pT').dataset.dirty) $('pT').value=s.pT;
+  if(!$('vU').dataset.dirty) $('vU').checked=!!s.vU;
+  if(!$('iU').dataset.dirty) $('iU').checked=!!s.iU;
+  if(!$('pU').dataset.dirty) $('pU').checked=!!s.pU;
   $('apIp').textContent=s.ip||'192.168.4.1';
   $('apClients').textContent=s.cli||0;
   if(!$('ssid').dataset.dirty){
@@ -260,15 +265,32 @@ Forgot the AP password? Hold the BOOT button for 5 seconds to factory reset.
  }
  poll();
  function post(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(function(r){return r.json()})}
+ var RELAY_FIELDS=['enabled','activeHigh','vT','iT','pT','vU','iU','pU'];
+ RELAY_FIELDS.forEach(function(id){
+   var el=$(id); if(!el) return;
+   var ev=(el.type==='checkbox')?'change':'input';
+   el.addEventListener(ev,function(){el.dataset.dirty='1'});
+ });
+ function clearRelayDirty(){
+   RELAY_FIELDS.forEach(function(id){var el=$(id);if(el)delete el.dataset.dirty;});
+ }
  $('saveRelay').addEventListener('click',function(){
+  var en=$('enabled').checked;
+  var vT=parseFloat($('vT').value)||0, iT=parseFloat($('iT').value)||0, pT=parseFloat($('pT').value)||0;
+  var vU=$('vU').checked, iU=$('iU').checked, pU=$('pU').checked;
+  if(en && !((vU&&vT>0)||(iU&&iT>0)||(pU&&pT>0))){
+    $('relayMsg').textContent='Enable at least one channel with a threshold > 0, or turn auto off.';
+    return;
+  }
   post('/api/config',{
-   en:$('enabled').checked,ah:$('activeHigh').checked,
-   vT:parseFloat($('vT').value)||0,iT:parseFloat($('iT').value)||0,pT:parseFloat($('pT').value)||0,
-   vU:$('vU').checked,iU:$('iU').checked,pU:$('pU').checked
+   en:en,ah:$('activeHigh').checked,
+   vT:vT,iT:iT,pT:pT,
+   vU:vU,iU:iU,pU:pU
   }).then(function(r){
-   $('relayMsg').textContent=r.ok?'Saved.':'Save failed.';
-   if(r.ok) setTimeout(poll,150);
-   setTimeout(function(){$('relayMsg').textContent=''},2500);
+   if(r.ok){ $('relayMsg').textContent='Saved.'; clearRelayDirty(); setTimeout(poll,150); }
+   else if(r && r.err==='no-threshold'){ $('relayMsg').textContent='Enable at least one channel with a threshold > 0.'; }
+   else { $('relayMsg').textContent='Save failed.'; }
+   setTimeout(function(){$('relayMsg').textContent=''},3000);
   }).catch(function(){$('relayMsg').textContent='Network error.'});
  });
  ['ssid','ch','maxCli','hidden'].forEach(function(id){
@@ -283,7 +305,25 @@ Forgot the AP password? Hold the BOOT button for 5 seconds to factory reset.
   var ssid=$('ssid').value.trim();
   var changePass=$('chgPass').checked;
   var pass=$('pass').value;
-  if(ssid.length<1||ssid.length>32){$('apMsg').textContent='SSID must be 1–32 chars.';return}
+  function utf8Len(s){
+    var n=0;
+    for(var i=0;i<s.length;i++){
+      var c=s.charCodeAt(i);
+      if(c<0x80) n+=1;
+      else if(c<0x800) n+=2;
+      else if(c>=0xD800&&c<=0xDBFF){
+        if(i+1<s.length){
+          var d=s.charCodeAt(i+1);
+          if(d>=0xDC00&&d<=0xDFFF){ n+=4; i++; }
+          else { n+=3; }
+        } else { n+=3; }
+      }
+      else n+=3;
+    }
+    return n;
+  }
+  var ssidBytes=utf8Len(ssid);
+  if(ssidBytes<1||ssidBytes>32){$('apMsg').textContent='SSID must be 1–32 bytes (UTF-8). Current: '+ssidBytes+' bytes.';return}
   if(changePass && pass.length!==0 && (pass.length<8||pass.length>63)){$('apMsg').textContent='Password must be empty or 8–63 chars.';return}
   if(!confirm('Changing WiFi AP settings will disconnect you and reboot the ESP32. Continue?'))return;
   var body={
@@ -296,7 +336,12 @@ Forgot the AP password? Hold the BOOT button for 5 seconds to factory reset.
   $('apMsg').textContent='Saving and rebooting… you will be disconnected.';
   post('/api/ap',body).then(function(r){
    if(r && r.ok){ $('apMsg').textContent='Rebooting… reconnect to your AP.'; }
-   else { $('apMsg').textContent='Save failed.'; }
+   else {
+     $('apMsg').textContent='Save failed.';
+     ['ssid','ch','maxCli','hidden'].forEach(function(id){
+       var el=$(id); if(el) delete el.dataset.dirty;
+     });
+   }
   }).catch(function(){ $('apMsg').textContent='Rebooting… reconnect to your AP.'; });
  });
  $('btnRestart').addEventListener('click',function(){
@@ -400,11 +445,21 @@ static void sampleSensors(){
   if(!isfinite(p)) p=0.0f;
   g_voltage=v; g_current=i; g_power=p;
 
+  const float H = 0.02f;
   bool shouldOn=false;
   if(cfg.relayEnabled){
-    if(cfg.useVoltage && cfg.vThresh>0 && v>=cfg.vThresh) shouldOn=true;
-    if(cfg.useCurrent && cfg.iThresh>0 && i>=cfg.iThresh) shouldOn=true;
-    if(cfg.usePower   && cfg.pThresh>0 && p>=cfg.pThresh) shouldOn=true;
+    if(cfg.useVoltage && cfg.vThresh>0){
+      float trip = g_relayOn ? cfg.vThresh*(1.0f-H) : cfg.vThresh;
+      if(v>=trip) shouldOn=true;
+    }
+    if(cfg.useCurrent && cfg.iThresh>0){
+      float trip = g_relayOn ? cfg.iThresh*(1.0f-H) : cfg.iThresh;
+      if(i>=trip) shouldOn=true;
+    }
+    if(cfg.usePower && cfg.pThresh>0){
+      float trip = g_relayOn ? cfg.pThresh*(1.0f-H) : cfg.pThresh;
+      if(p>=trip) shouldOn=true;
+    }
   }
   setRelay(shouldOn);
 }
@@ -482,18 +537,40 @@ static void handleAndroid204(){
   server.send(302,"text/plain","");
 }
 
+static void jsonEscapeInto(const char* in, char* out, size_t outLen){
+  if(!out || outLen==0) return;
+  size_t o=0;
+  for(const char* p=in; *p && o+7<outLen; ++p){
+    unsigned char c=(unsigned char)*p;
+    if(c=='"' || c=='\\'){
+      out[o++]='\\'; out[o++]=(char)c;
+    } else if(c=='\n'){ out[o++]='\\'; out[o++]='n'; }
+    else if(c=='\r'){ out[o++]='\\'; out[o++]='r'; }
+    else if(c=='\t'){ out[o++]='\\'; out[o++]='t'; }
+    else if(c<0x20){
+      int n=snprintf(out+o,outLen-o,"\\u%04x",c);
+      if(n>0) o+=(size_t)n;
+    } else {
+      out[o++]=(char)c;
+    }
+  }
+  out[o]='\0';
+}
+
 static void handleState(){
-  static char buf[1024];
+  static char buf[1400];
   uint64_t upUs = (uint64_t)esp_timer_get_time();
   unsigned long upSec = (unsigned long)(upUs/1000000ULL);
   String ip = WiFi.softAPIP().toString();
+  char jsonEscSsid[sizeof(cfg.apSsid)*6 + 1];
+  jsonEscapeInto(cfg.apSsid, jsonEscSsid, sizeof(jsonEscSsid));
   int n = snprintf(buf, sizeof(buf),
     "{\"v\":%.3f,\"i\":%.4f,\"p\":%.3f,"
     "\"relay\":%s,\"en\":%s,\"ah\":%s,"
     "\"vT\":%.3f,\"iT\":%.4f,\"pT\":%.3f,"
     "\"vU\":%s,\"iU\":%s,\"pU\":%s,"
     "\"ip\":\"%s\",\"cli\":%u,"
-    "\"ssid\":\"%.32s\",\"ch\":%u,\"hidden\":%s,\"maxCli\":%u,"
+    "\"ssid\":\"%s\",\"ch\":%u,\"hidden\":%s,\"maxCli\":%u,"
     "\"heap\":%u,\"minheap\":%u,"
     "\"up\":\"%lus\",\"rst\":\"%d\"}",
     (double)g_voltage,(double)g_current,(double)g_power,
@@ -506,7 +583,7 @@ static void handleState(){
     cfg.usePower?"true":"false",
     ip.c_str(),
     (unsigned)WiFi.softAPgetStationNum(),
-    cfg.apSsid,
+    jsonEscSsid,
     (unsigned)cfg.apChannel,
     cfg.apHidden?"true":"false",
     (unsigned)cfg.apMaxClients,
@@ -524,8 +601,19 @@ static void handleState(){
 
 static const char* findKey(const char* b, const char* k){
   char needle[24];
-  snprintf(needle,sizeof(needle),"\"%s\":",k);
-  return strstr(b,needle);
+  int nl=snprintf(needle,sizeof(needle),"\"%s\":",k);
+  if(nl<=0||nl>=(int)sizeof(needle)) return nullptr;
+  const char* p=b;
+  while((p=strstr(p,needle))){
+    bool inString=false;
+    for(const char* q=b; q<p; ++q){
+      if(*q=='\\'){ if(q[1]) ++q; continue; }
+      if(*q=='"') inString=!inString;
+    }
+    if(!inString) return p;
+    p += nl;
+  }
+  return nullptr;
 }
 static bool jNum(const char* b,const char* k,float& o){
   const char* p=findKey(b,k);
@@ -557,8 +645,47 @@ static bool jStr(const char* b,const char* k,char* out,size_t outLen){
   p++;
   size_t i=0;
   while(*p && *p!='"' && i<outLen-1){
-    if(*p=='\\' && p[1]){ p++; }
-    out[i++]=*p++;
+    if(*p=='\\' && p[1]){
+      p++;
+      char e=*p++;
+      char c=e;
+      if(e=='n') c='\n';
+      else if(e=='t') c='\t';
+      else if(e=='r') c='\r';
+      else if(e=='b') c='\b';
+      else if(e=='f') c='\f';
+      else if(e=='/') c='/';
+      else if(e=='"') c='"';
+      else if(e=='\\') c='\\';
+      else if(e=='u'){
+        if(p[0]&&p[1]&&p[2]&&p[3]){
+          char hex[5]={p[0],p[1],p[2],p[3],0};
+          char* endp=nullptr;
+          unsigned long cp=strtoul(hex,&endp,16);
+          if(endp!=hex+4){ c='u'; }
+          else {
+            p+=4;
+            if(cp==0){ continue; }
+            if(cp<=0x7F) c=(char)cp;
+            else if(cp<=0x7FF){
+              if(i+1>=outLen-1) break;
+              out[i++]=(char)(0xC0|(cp>>6));
+              c=(char)(0x80|(cp&0x3F));
+            } else {
+              if(i+2>=outLen-1) break;
+              out[i++]=(char)(0xE0|(cp>>12));
+              out[i++]=(char)(0x80|((cp>>6)&0x3F));
+              c=(char)(0x80|(cp&0x3F));
+            }
+          }
+        } else {
+          c='u';
+        }
+      }
+      out[i++]=c;
+    } else {
+      out[i++]=*p++;
+    }
   }
   out[i]='\0';
   return (*p=='"');
@@ -568,7 +695,8 @@ static void handleConfig(){
   if(!server.hasArg("plain")){ server.send(400,"application/json","{\"ok\":false}"); return; }
   const char* body = server.arg("plain").c_str();
 
-  bool en=false,ah=false,vU=false,iU=false,pU=false;
+  bool en=cfg.relayEnabled,ah=cfg.relayActiveHigh;
+  bool vU=cfg.useVoltage,iU=cfg.useCurrent,pU=cfg.usePower;
   float vT=cfg.vThresh,iT=cfg.iThresh,pT=cfg.pThresh;
   jBool(body,"en",en); jBool(body,"ah",ah);
   jBool(body,"vU",vU); jBool(body,"iU",iU); jBool(body,"pU",pU);
@@ -577,6 +705,14 @@ static void handleConfig(){
   if(!isfinite(vT)||vT<0||vT>32)   vT=0;
   if(!isfinite(iT)||iT<0||iT>3.2f) iT=0;
   if(!isfinite(pT)||pT<0||pT>100)  pT=0;
+  if(en){
+    bool anyArmed = (vU && vT>0.0f) || (iU && iT>0.0f) || (pU && pT>0.0f);
+    if(!anyArmed){
+      server.sendHeader("Cache-Control","no-store");
+      server.send(400,"application/json","{\"ok\":false,\"err\":\"no-threshold\"}");
+      return;
+    }
+  }
 
   cfg.version = CONFIG_VERSION;
   cfg.relayEnabled=en; cfg.relayActiveHigh=ah;
@@ -614,10 +750,6 @@ static void handleApConfig(){
   } else {
     strncpy(pass, cfg.apPass, sizeof(pass)-1);
     pass[sizeof(pass)-1]=0;
-    if(!pass[0]){
-      strncpy(pass, AP_PASS, sizeof(pass)-1);
-      pass[sizeof(pass)-1]=0;
-    }
   }
   jNum(body,"ch",ch);
   jBool(body,"hidden",hidden);
@@ -662,15 +794,6 @@ static void handleFactory(){
 static void handleNotFound(){
   if(server.method() != HTTP_GET){
     server.send(405,"text/plain","");
-    return;
-  }
-  String uri = server.uri();
-  if((uri == "/" || uri == "/index.html") &&
-     server.hostHeader() == WiFi.softAPIP().toString()){
-    server.sendHeader("Cache-Control","no-store, no-cache, must-revalidate");
-    server.sendHeader("Pragma","no-cache");
-    server.sendHeader("Expires","0");
-    server.send_P(200,"text/html",INDEX_HTML);
     return;
   }
   String url = portalUrl();
@@ -725,7 +848,10 @@ static void maintainAP(uint32_t now){
   if(!timeReached(now,tLastWifiCheck,WIFI_RECHECK_MS)) return;
   tLastWifiCheck=now;
   wifi_mode_t m = WiFi.getMode();
-  if(m != WIFI_AP && m != WIFI_AP_STA){
+  bool modeOk = (m == WIFI_AP || m == WIFI_AP_STA);
+  IPAddress apIp = WiFi.softAPIP();
+  bool ipOk = (apIp != IPAddress(0,0,0,0));
+  if(!modeOk || !ipOk){
     startAP();
     startCaptivePortal();
   }
@@ -735,8 +861,6 @@ static void maintainAP(uint32_t now){
 // Setup / Loop
 // ---------------------------------------------------------------------------
 void setup(){
-  pinMode(RELAY_PIN,OUTPUT);
-  digitalWrite(RELAY_PIN,LOW);
   pinMode(BOOT_BUTTON_PIN,INPUT_PULLUP);
 
   Wire.begin(I2C_SDA,I2C_SCL);
@@ -744,6 +868,7 @@ void setup(){
   ina219.setCalibration_32V_2A();
 
   loadConfig();
+  pinMode(RELAY_PIN, OUTPUT);
   applyRelayHardware();
   cfgLastFlushMs = millis();
 
