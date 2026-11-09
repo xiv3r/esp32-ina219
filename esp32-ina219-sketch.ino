@@ -418,8 +418,11 @@ static void handleState(){
     upSec,
     (int)esp_reset_reason());
   if(n<0) n=0;
+  if(n>=(int)sizeof(buf)) n=(int)sizeof(buf)-1;
   server.sendHeader("Cache-Control","no-store");
-  server.send(200,"application/json",buf,(size_t)n);
+  server.setContentLength((size_t)n);
+  server.send(200,"application/json","");
+  server.sendContent(buf,(size_t)n);
 }
 
 static const char* findKey(const char* b, const char* k){
