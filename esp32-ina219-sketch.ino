@@ -289,6 +289,9 @@ Forgot the AP password? Hold the BOOT button for 5 seconds to factory reset.
   }).then(function(r){
    if(r.ok){ $('relayMsg').textContent='Saved.'; clearRelayDirty(); setTimeout(poll,150); }
    else if(r && r.err==='no-threshold'){ $('relayMsg').textContent='Enable at least one channel with a threshold > 0.'; }
+   else if(r && r.err==='vT-range'){ $('relayMsg').textContent='Voltage threshold must be 0–32 V.'; }
+   else if(r && r.err==='iT-range'){ $('relayMsg').textContent='Current threshold must be 0–3.2 A.'; }
+   else if(r && r.err==='pT-range'){ $('relayMsg').textContent='Power threshold must be 0–100 W.'; }
    else { $('relayMsg').textContent='Save failed.'; }
    setTimeout(function(){$('relayMsg').textContent=''},3000);
   }).catch(function(){$('relayMsg').textContent='Network error.'});
@@ -346,11 +349,15 @@ Forgot the AP password? Hold the BOOT button for 5 seconds to factory reset.
  });
  $('btnRestart').addEventListener('click',function(){
   if(!confirm('Restart ESP32?'))return;
-  post('/api/restart').then(function(){$('sysMsg').textContent='Restarting…'});
+  $('sysMsg').textContent='Restarting…';
+  post('/api/restart').then(function(){$('sysMsg').textContent='Restarting…'})
+    .catch(function(){$('sysMsg').textContent='Restart sent — reconnect if page drops.'});
  });
  $('btnFactory').addEventListener('click',function(){
   if(!confirm('Factory reset will erase all settings. Continue?'))return;
-  post('/api/factory').then(function(){$('sysMsg').textContent='Resetting…'});
+  $('sysMsg').textContent='Resetting…';
+  post('/api/factory').then(function(){$('sysMsg').textContent='Resetting…'})
+    .catch(function(){$('sysMsg').textContent='Reset sent — reconnect to default AP.'});
  });
 })();
 </script></body></html>)HTML";
@@ -409,9 +416,9 @@ static void loadConfig(){
     cfg.apChannel=1; cfg.apHidden=false; cfg.apMaxClients=4;
     cfgDirty=true;
   }
-  if(!cfg.apSsid[0]){ strncpy(cfg.apSsid, AP_SSID, sizeof(cfg.apSsid)-1); cfg.apSsid[sizeof(cfg.apSsid)-1]=0; }
-  if(cfg.apChannel<1||cfg.apChannel>13) cfg.apChannel=1;
-  if(cfg.apMaxClients<1||cfg.apMaxClients>8) cfg.apMaxClients=4;
+  if(!cfg.apSsid[0]){ strncpy(cfg.apSsid, AP_SSID, sizeof(cfg.apSsid)-1); cfg.apSsid[sizeof(cfg.apSsid)-1]=0; cfgDirty=true; }
+  if(cfg.apChannel<1||cfg.apChannel>13){ cfg.apChannel=1; cfgDirty=true; }
+  if(cfg.apMaxClients<1||cfg.apMaxClients>8){ cfg.apMaxClients=4; cfgDirty=true; }
 }
 
 static void flushConfigIfDue(uint32_t now, bool force){
@@ -420,7 +427,8 @@ static void flushConfigIfDue(uint32_t now, bool force){
   prefs.begin("ina219", false);
   size_t w = prefs.putBytes("cfg", &cfg, sizeof(cfg));
   if(w==sizeof(cfg)){
-    prefs.putUInt("crc", cfgCrc(cfg));
+    size_t cw = prefs.putUInt("crc", cfgCrc(cfg));
+    if(cw != sizeof(uint32_t)){ prefs.end(); return; }
     Config rb;
     bool vOk=false;
     if(prefs.getBytes("cfg",&rb,sizeof(rb))==sizeof(rb) &&
@@ -665,15 +673,31 @@ static bool jStr(const char* b,const char* k,char* out,size_t outLen){
           if(endp!=hex+4){ c='u'; }
           else {
             p+=4;
+            if(cp>=0xD800UL && cp<=0xDBFFUL && p[0]=='\\' && p[1]=='u'
+               && p[2]&&p[3]&&p[4]&&p[5]){
+              char hex2[5]={p[2],p[3],p[4],p[5],0};
+              char* endp2=nullptr;
+              unsigned long lo=strtoul(hex2,&endp2,16);
+              if(endp2==hex2+4 && lo>=0xDC00UL && lo<=0xDFFFUL){
+                cp = 0x10000UL + ((cp-0xD800UL)<<10) + (lo-0xDC00UL);
+                p += 6;
+              }
+            }
             if(cp==0){ continue; }
             if(cp<=0x7F) c=(char)cp;
             else if(cp<=0x7FF){
               if(i+1>=outLen-1) break;
               out[i++]=(char)(0xC0|(cp>>6));
               c=(char)(0x80|(cp&0x3F));
-            } else {
+            } else if(cp<=0xFFFF){
               if(i+2>=outLen-1) break;
               out[i++]=(char)(0xE0|(cp>>12));
+              out[i++]=(char)(0x80|((cp>>6)&0x3F));
+              c=(char)(0x80|(cp&0x3F));
+            } else {
+              if(i+3>=outLen-1) break;
+              out[i++]=(char)(0xF0|(cp>>18));
+              out[i++]=(char)(0x80|((cp>>12)&0x3F));
               out[i++]=(char)(0x80|((cp>>6)&0x3F));
               c=(char)(0x80|(cp&0x3F));
             }
@@ -693,7 +717,8 @@ static bool jStr(const char* b,const char* k,char* out,size_t outLen){
 
 static void handleConfig(){
   if(!server.hasArg("plain")){ server.send(400,"application/json","{\"ok\":false}"); return; }
-  const char* body = server.arg("plain").c_str();
+  String bodyStr = server.arg("plain");
+  const char* body = bodyStr.c_str();
 
   bool en=cfg.relayEnabled,ah=cfg.relayActiveHigh;
   bool vU=cfg.useVoltage,iU=cfg.useCurrent,pU=cfg.usePower;
@@ -702,9 +727,21 @@ static void handleConfig(){
   jBool(body,"vU",vU); jBool(body,"iU",iU); jBool(body,"pU",pU);
   jNum(body,"vT",vT);  jNum(body,"iT",iT);  jNum(body,"pT",pT);
 
-  if(!isfinite(vT)||vT<0||vT>32)   vT=0;
-  if(!isfinite(iT)||iT<0||iT>3.2f) iT=0;
-  if(!isfinite(pT)||pT<0||pT>100)  pT=0;
+  if(!isfinite(vT)||vT<0||vT>32){
+    server.sendHeader("Cache-Control","no-store");
+    server.send(400,"application/json","{\"ok\":false,\"err\":\"vT-range\"}");
+    return;
+  }
+  if(!isfinite(iT)||iT<0||iT>3.2f){
+    server.sendHeader("Cache-Control","no-store");
+    server.send(400,"application/json","{\"ok\":false,\"err\":\"iT-range\"}");
+    return;
+  }
+  if(!isfinite(pT)||pT<0||pT>100){
+    server.sendHeader("Cache-Control","no-store");
+    server.send(400,"application/json","{\"ok\":false,\"err\":\"pT-range\"}");
+    return;
+  }
   if(en){
     bool anyArmed = (vU && vT>0.0f) || (iU && iT>0.0f) || (pU && pT>0.0f);
     if(!anyArmed){
@@ -720,8 +757,14 @@ static void handleConfig(){
   cfg.vThresh=vT;      cfg.iThresh=iT;       cfg.pThresh=pT;
   cfgDirty=true;
 
+  if(!cfg.relayEnabled) g_relayOn = false;
   applyRelayHardware();
   flushConfigIfDue(millis(), true);
+  if(cfgDirty){
+    server.sendHeader("Cache-Control","no-store");
+    server.send(500,"application/json","{\"ok\":false,\"err\":\"nvs\"}");
+    return;
+  }
 
   server.sendHeader("Cache-Control","no-store");
   server.send(200,"application/json","{\"ok\":true}");
@@ -732,7 +775,8 @@ static bool validPass(const char* s){ size_t n=strlen(s); return n==0 || (n>=8 &
 
 static void handleApConfig(){
   if(!server.hasArg("plain")){ server.send(400,"application/json","{\"ok\":false,\"err\":\"body\"}"); return; }
-  const char* body = server.arg("plain").c_str();
+  String bodyStr = server.arg("plain");
+  const char* body = bodyStr.c_str();
 
   char ssid[33] = {0};
   char pass[64] = {0};
@@ -779,7 +823,7 @@ static void handleApConfig(){
 static void handleRestart(){
   server.sendHeader("Cache-Control","no-store");
   server.send(200,"application/json","{\"ok\":true}");
-  delay(150);
+  delay(400);
   flushConfigIfDue(millis(), true);
   ESP.restart();
 }
@@ -787,7 +831,7 @@ static void handleRestart(){
 static void handleFactory(){
   server.sendHeader("Cache-Control","no-store");
   server.send(200,"application/json","{\"ok\":true}");
-  delay(200);
+  delay(400);
   doFactoryReset();
 }
 
@@ -820,6 +864,10 @@ static void startAP(){
   uint8_t ch  = (cfg.apChannel    ? cfg.apChannel    : 1);
   uint8_t maxc= (cfg.apMaxClients ? cfg.apMaxClients : 4);
   bool up = WiFi.softAP(ssid, pass, ch, cfg.apHidden, maxc);
+  if(!up && pass[0] && strlen(pass) < 8){
+    up = WiFi.softAP(ssid, nullptr, ch, cfg.apHidden, maxc);
+    if(up){ cfg.apPass[0]=0; cfgDirty=true; }
+  }
   if(!up && ch > 11){
     ch = 11;
     up = WiFi.softAP(ssid, pass, ch, cfg.apHidden, maxc);
@@ -868,6 +916,7 @@ void setup(){
   ina219.setCalibration_32V_2A();
 
   loadConfig();
+  digitalWrite(RELAY_PIN, cfg.relayActiveHigh ? LOW : HIGH);
   pinMode(RELAY_PIN, OUTPUT);
   applyRelayHardware();
   cfgLastFlushMs = millis();
