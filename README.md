@@ -2,128 +2,94 @@
 
 ## 1. Hardware Wiring
 
-| Component | ESP32 Pin |
+| Signal | ESP32 Pin |
 |---|---|
-| **Relay module IN** | GPIO25 |
-| **Relay module VCC** | 3.3 V (or 5 V if module requires) |
-| **Relay module GND** | GND |
-| **INA219 VCC** | 3.3 V |
-| **INA219 GND** | GND |
-| **INA219 SDA** | GPIO21 |
-| **INA219 SCL** | GPIO22 |
-| **INA219 VIN+** | Power supply positive |
-| **INA219 VIN−** | Load positive |
-| **Load negative** | Power supply negative |
-| **BOOT button** | GPIO0 (built-in) |
+| I2C SDA | GPIO21 |
+| I2C SCL | GPIO22 |
+| Relay — Unified / Voltage | GPIO25 |
+| Relay — Current | GPIO26 |
+| Relay — Power | GPIO27 |
+| BOOT button (factory reset) | GPIO0 (built-in) |
+| Status LED | GPIO2 |
 
-> **Important:** Place INA219 in series with the load — current must flow through VIN+ → VIN−. Do **not** exceed 32 V or 2 A.
+INA219 default addresses: `0x40`, `0x41`, `0x44`, `0x45` (Adafruit breakouts). Up to 6 sensors supported (0x40–0x4F).
 
----
+## 2. Flashing
 
-## 2. Install Libraries (Arduino IDE)
+1. Open `ESP32_INA219_Production.ino` in Arduino IDE.
+2. Install libraries: **Adafruit INA219**, **ESPAsyncWebServer**, **AsyncTCP**.
+3. Select board: **ESP32 Dev Module** (or your variant).
+4. Set partition scheme with enough NVS/app space (default 4MB with 1.2MB app is fine).
+5. Upload.
 
-1. Open **Arduino IDE** → **Tools → Board → ESP32 Dev Module**
-2. Go to **Sketch → Include Library → Manage Libraries**
-3. Install:
-   - **Adafruit INA219** (by Adafruit)
-   - **Adafruit BusIO** (auto-prompts as dependency)
-4. ESP32 core (WiFi, WebServer, DNSServer, Preferences) is **bundled** — no install needed.
+## 3. First Boot & Wi-Fi
 
----
-
-## 3. Upload the Sketch
-
-1. Paste the full code into a new `.ino` file.
-2. Select the correct **COM port**.
-3. Click **Upload**.
-4. Wait for `Done uploading.`
-
----
-
-## 4. First Boot
-
-1. Power the ESP32.
-2. On your phone/laptop, open WiFi settings.
-3. Connect to:
+1. Power on. Device starts a Wi-Fi AP:
    - **SSID:** `ESP32_INA219`
    - **Password:** `12345678`
-4. A **captive portal** may pop up automatically — if not, open a browser and go to:
-   ```
-   http://192.168.4.1
-   ```
+   - **IP:** `192.168.4.1`
+2. Connect from phone/PC. Captive portal auto-redirects to the dashboard.
+3. Open `http://192.168.4.1/` if needed.
 
----
+## 4. Configure Sensors (`/sensors`)
 
-## 5. Using the Dashboard
+For each of the 6 sensor slots:
+- **Enable** the slot.
+- Set **I2C address** (must be unique; duplicate addresses auto-disable the later one).
+- Set **measurement range** (±320mV/32V, ±160mV/32V, or ±40mV/16V).
+- Set **shunt resistance** in mΩ (e.g. `100` for 0.1 Ω).
+- Set **voltage / current / power thresholds** (mV, mA, mW).
+- Set **hysteresis %** (0–25) and **debounce samples** (1–20).
+- Choose **relay routing** (Voltage→GPIO25, Current→GPIO26, Power→GPIO27).
 
-### Dashboard tab
-- Shows live **Voltage**, **Current**, **Power** updated every second.
-- Shows **Relay** ON/OFF status.
+Click **Save sensor settings**.
 
-### Relay tab
-1. **Enable auto thresholds** → turn ON.
-2. **Active HIGH relay** → turn ON for active-high relay modules, OFF for active-low.
-3. Set thresholds:
-   - **Voltage (V)** — e.g. `12.5`
-   - **Current (A)** — e.g. `0.5`
-   - **Power (W)** — e.g. `10`
-4. Enable each with its **Use** toggle.
-5. Tap **Save Settings**.
+## 5. Configure Relays (`/relays`)
 
-> Relay turns **ON** when **any** enabled threshold is met (OR logic). All settings are saved to flash automatically.
+- **Active-low outputs** — enable for LOW-trigger relay modules.
+- **Latch alarms** — relay stays on until acknowledged.
+- **Min ON time** / **hold-off OFF time** — anti-chatter timing.
+- **Sample interval** — how often sensors are read (100–60000 ms).
+- **Manual override** — Auto / Force ON / Force OFF / 30 s ON per channel.
 
-### WiFi AP tab
-- Read-only info: SSID, IP, connected clients, captive portal status.
-- AP is **always active** — self-heals if it drops.
+## 6. Wi-Fi Settings (`/wifi`)
 
-### System tab
-- **Uptime**, **Free heap**, **Min free heap**, **Reset reason**.
-- **Restart** — reboots ESP32 (settings preserved).
-- **Factory Reset** — erases all settings and reboots.
+- Change SSID (max 31 chars), password (8–63 chars, or empty = open AP), channel (1–13), max clients (4/8/10).
+- Toggle **hidden SSID** and **captive portal**.
+- **Apply** — AP restarts in ~1.5 s; reconnect to the new SSID.
 
----
+## 7. Dashboard (`/`)
 
-## 6. Factory Reset
+- Live voltage / current / power per sensor with sparkline history.
+- Alarm banner + **Acknowledge all**.
+- Relay state pills and quick manual controls.
+- Runtime health: uptime, free heap, client count, config validity.
+- Boot-button reset progress bar (hold GPIO0 for **5 s**).
 
-**Option A — Button:** Hold the **BOOT** button (GPIO0) for **5 seconds**. Relay will blink 6 times, then the board reboots with default settings.
+## 8. Factory Reset
 
-**Option B — Web:** Go to **System tab → Factory Reset → confirm**.
+**Method A — Physical:** Hold the **BOOT (GPIO0)** button for **5 seconds** until the LED blinks rapidly; device reboots with defaults.
 
----
+**Method B — Web:** `/wifi` or `/system` → **Factory reset** (confirm dialog) → device reboots.
 
-## 7. Troubleshooting
+## 9. System Diagnostics (`/system`)
 
-| Problem | Fix |
-|---|---|
-| No AP `ESP32_INA219` | Check power; press EN/reset button once |
-| Readings show `0.00` | Check I2C wiring (SDA=21, SCL=22); check INA219 has power |
-| Relay never toggles | Confirm **Enable auto thresholds** is ON and threshold value > 0 and its **Use** toggle is ON |
-| Relay behaves inverted | Toggle **Active HIGH relay** setting |
-| Portal doesn't open | Manually browse `http://192.168.4.1` |
-| Wrong readings | Verify load is wired through INA219 (VIN+ → VIN−) |
-| Can't connect after factory reset | Reconnect to `ESP32_INA219` / `12345678` |
+Shows uptime, heap, min heap, sample/failure counters, NVS write/skip counts, and the config CRC64. Use for troubleshooting.
 
----
+## 10. Operational Notes
 
-## 8. Quick Reference
+- Config is stored in **two alternating NVS slots** with CRC64 + sequence; writes are debounced (3 s) and rate-limited (8 s min gap, 5 s boot guard).
+- All numeric inputs are validated and clamped; invalid values fall back to defaults.
+- Relay outputs start **de-energized** on every boot.
+- GPIO25 is **shared** by the Unified and Voltage functions — it energizes if either demands it.
+- No blocking delays; millis rollover handled via 64-bit software clock.
+- Status LED: slow blink = normal, fast blink = boot button held / reboot armed, medium = alarm active.
 
-| Item | Value |
-|---|---|
-| AP SSID | `ESP32_INA219` |
-| AP Password | `12345678` |
-| AP IP | `192.168.4.1` |
-| Relay pin | GPIO25 |
-| Reset button | GPIO0 (hold 5 s) |
-| I2C pins | SDA=21, SCL=22 |
-| INA219 I2C address | `0x40` |
-| Sample rate | 1 Hz |
-| NVS flush interval | 60 s (forced on Save) |
+## 11. REST API (optional)
 
----
-
-## 9. Safety Limits
-
-- **Max voltage:** 32 V
-- **Max current:** 2 A
-- **Max clients:** 4 simultaneous
-- Do **not** exceed these — sensor calibration clamps readings.
+- `GET  /api/status` — full runtime JSON
+- `GET  /api/config` — current config JSON
+- `POST /api/config/sensors` — form-urlencoded sensor settings
+- `POST /api/config/relays` — relay behavior settings
+- `POST /api/config/wifi` — AP settings (triggers AP restart)
+- `POST /api/action` — `action=ack|relay|reboot|factory_reset|refresh_page` (factory_reset requires `confirm=yes`)
