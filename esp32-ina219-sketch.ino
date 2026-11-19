@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
@@ -282,6 +281,28 @@ void jsonEscape(const char *source, char *destination, size_t capacity) {
   destination[position] = '\0';
 }
 
+void htmlEscape(const char *source, char *destination, size_t capacity) {
+  size_t position = 0;
+  if (capacity == 0) return;
+  for (size_t index = 0; source[index] != '\0'; index++) {
+    const char *entity = NULL;
+    unsigned char character = (unsigned char)source[index];
+    if (character == '&') entity = "&amp;";
+    else if (character == '<') entity = "&lt;";
+    else if (character == '>') entity = "&gt;";
+    else if (character == '"') entity = "&quot;";
+    else if (character == '\'') entity = "&#39;";
+    size_t entityLength = (entity == NULL) ? 1 : strlen(entity);
+    if (position + entityLength + 1 >= capacity) break;
+    if (entity == NULL) destination[position++] = (char)character;
+    else {
+      memcpy(destination + position, entity, entityLength);
+      position += entityLength;
+    }
+  }
+  destination[position] = '\0';
+}
+
 uint64_t crc64Update(uint64_t crc, const uint8_t *data, size_t length) {
   for (size_t index = 0; index < length; index++) {
     crc ^= (uint64_t)data[index] << 56;
@@ -528,7 +549,7 @@ void persistConfigNow(bool force) {
       return;
     }
   }
-  g_activeSlot = (target == CFG_SLOT_A) ? 0 : 1;
+  g_activeSlot = (strcmp(target, CFG_SLOT_A) == 0) ? 0 : 1;
   g_configSequence = candidate.sequence;
   g_configCrc = candidate.crc;
   g_configDirty = 0;
@@ -688,6 +709,7 @@ uint64_t evaluateAlarm(AlarmState &alarm, int64_t value, int64_t minimum, int64_
     alarm.offCount = 0;
   } else if (alarm.active && alarm.offCount >= debounceSamples) {
     alarm.active = 0;
+    if (!g_config.relayLatch) alarm.latched = 0;
     alarm.lastChangeMs = currentTime;
     alarm.onCount = 0;
     alarm.offCount = 0;
@@ -1166,6 +1188,8 @@ void buildSensorSettingsPage(size_t &used) {
 )HTML");
   for (uint64_t index = 0; index < INA219_MAX_SENSORS; index++) {
     SensorConfig &sensor = g_config.sensor[index];
+    char escapedName[192];
+    htmlEscape(sensor.name, escapedName, sizeof(escapedName));
     appendFmt(g_pageBuffer, sizeof(g_pageBuffer), used,
       "<fieldset class=\"mt\"><legend>Sensor %llu</legend>"
       "<div class=\"switch\"><span><b>Enable this sensor</b></span><input type=\"checkbox\" name=\"s%llu_en\" value=\"1\" %s></div>"
@@ -1173,7 +1197,7 @@ void buildSensorSettingsPage(size_t &used) {
       "<div class=\"field\"><label>Label</label><input name=\"s%llu_name\" maxlength=\"23\" value=\"%s\"></div>"
       "<div class=\"field\"><label>I2C address</label><select name=\"s%llu_addr\">",
       (unsigned long long)(index + 1ULL), (unsigned long long)index, checkedAttribute(sensor.enabled),
-      (unsigned long long)index, sensor.name, (unsigned long long)index);
+      (unsigned long long)index, escapedName, (unsigned long long)index);
     for (uint64_t address = 0x40; address <= 0x4F; address++) {
       appendFmt(g_pageBuffer, sizeof(g_pageBuffer), used, "<option value=\"0x%02llX\"%s>0x%02llX</option>",
         (unsigned long long)address, sensor.address == address ? " selected" : "", (unsigned long long)address);
@@ -1309,8 +1333,12 @@ void buildWifiPage(size_t &used) {
 <div class="btn-row mt"><button class="btn" data-action="reboot" data-confirm="Reboot the controller now?">Reboot device</button><button class="btn danger" data-action="factory_reset" data-confirm="Erase all settings and restore factory defaults?">Factory reset</button></div>
 </div></div>
 )HTML");
-  replaceToken(g_pageBuffer, "WIFI_SSID", g_config.wifiSsid);
-  replaceToken(g_pageBuffer, "WIFI_PASS", g_config.wifiPassword);
+  char escapedSsid[256];
+  char escapedPassword[512];
+  htmlEscape(g_config.wifiSsid, escapedSsid, sizeof(escapedSsid));
+  htmlEscape(g_config.wifiPassword, escapedPassword, sizeof(escapedPassword));
+  replaceToken(g_pageBuffer, "WIFI_SSID", escapedSsid);
+  replaceToken(g_pageBuffer, "WIFI_PASS", escapedPassword);
   replaceToken(g_pageBuffer, "HIDDEN_CHECKED", g_config.wifiHidden ? "checked" : "");
   replaceToken(g_pageBuffer, "PORTAL_CHECKED", g_config.portalEnabled ? "checked" : "");
   char channelBuffer[512];
@@ -1448,7 +1476,8 @@ void handleStatusApi(AsyncWebServerRequest *request) {
   jsonEscape(g_config.wifiSsid, escapedSsid, sizeof(escapedSsid));
   uint64_t alarmCount = 0;
   for (uint64_t index = 0; index < INA219_MAX_SENSORS; index++) {
-    if (g_sensorState[index].statusCode == 3) alarmCount++;
+    SensorState &state = g_sensorState[index];
+    if (state.statusCode == 3 || state.voltageAlarm.latched || state.currentAlarm.latched || state.powerAlarm.latched) alarmCount++;
   }
   appendFmt(g_jsonBuffer, sizeof(g_jsonBuffer), used,
     "{\"ok\":true,\"uptimeMs\":%llu,\"uptimeText\":\"%s\",\"heapFree\":%u,\"heapMin\":%u,\"samples\":%llu,\"failures\":%llu,\"alarmCount\":%llu,"
